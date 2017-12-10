@@ -5,6 +5,7 @@
 # source files
 *.csv
 *.xlsx
+*.h5
 
 # image files
 *.png
@@ -13,3 +14,4 @@
 
 # html files
 *.html
+.DS_Store
