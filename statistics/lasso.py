@@ -12,6 +12,9 @@ import pandas as pd
 from sklearn.linear_model import Lasso
 
 FILE_NAME = 'data_aftercleaning'
+Y_COLUMN = '1년이내 상폐여부'
+
+idx = pd.IndexSlice
 
 
 def get_data():
@@ -27,7 +30,7 @@ def get_data():
     else:
         data = pd.read_excel(cur_dir + xls_file, sheet_name='merge')
         data.to_hdf(hdf_file, 'table')
-        print('creating {}'.format(hdf_file + 'table'))
+        print('Create {}'.format(hdf_file))
     data = data.dropna()  # nan값이 있으면 해당 행
     data = data.set_index(['year', 'company'])
 
@@ -67,21 +70,54 @@ def get_data():
                 comb_data["*".join((wholeCol[i], "1/" + invCol[j]))] = data[wholeCol[i]] \
                                                                        * inv_data["1/" + invCol[j]]
 
-    res_data = pd.concat([data, comb_data, dummy], 1)
-    file_names = list('data_' + dummy.columns + '.h5')
-    # sector별 파일 생성
-    for i in dummy.columns:
-        if Path(cur_dir + 'data_' + i + '.h5').exists():
-            print('data_' + i + '.h5 already exists')
-        else:
-            xx = res_data[res_data[i] == 1]
-            xx = xx.drop(dummy.columns, axis=1)
-            xx.to_hdf(cur_dir + 'data_{0:}.h5'.format(i), 'table')
-            print('creating data_' + i + '.h5')
+    # 시가 총액 / 시가 총액과 같은 데이터 제거
+    q = comb_data.sum()
+    # 대부분 1이 나오는 columns
+    q1 = q[(q <= data.shape[0] + 100) & (q >= data.shape[0] - 100)]
+    # 대부분 -1이 나오는 columns
+    q2 = q[(q <= -data.shape[0] + 100) & (q >= -data.shape[0] - 100)]
+    q = pd.concat([q1, q2])
+    # 위의 columns 는 지워준다.
+    for sector_name in range(q.index.size):
+        del comb_data[q.index[sector_name]]
 
-    run_data_dict = {}
-    for file_name, sector in zip(file_names, sectors):
-        run_data_dict[sector] = pd.read_hdf(file_name, 'table')
+    after_dummy_data = pd.concat([data, comb_data], 1).dropna()
+    after_dummy_data.to_hdf(cur_dir + 'data_{0:}.h5'.format('sector_total'), 'table')
+    file_names = list('data_' + dummy.columns + '.h5')
+
+    # sector별 파일 생성
+    factors = after_dummy_data.columns[1:]
+    for column in dummy.columns:
+        # communication 과 utility는 상폐 기업이 없어서 패스
+        if column in ['sector_communication', 'sector_utility']:
+            continue
+
+        # 이미 파일이 있다면 패스
+        file_name = 'data_{0:}.h5'.format(column)
+        if Path(cur_dir + file_name).exists():
+            print('{} is already exist.'.format(file_name))
+            continue
+
+        sector_column = dummy[column]
+        after_dummy_factor_data = after_dummy_data[factors]
+        xx = pd.DataFrame(after_dummy_factor_data.values.T * sector_column.values).T
+        xx.index = inv_data.index
+        xx.columns = factors
+        xx = pd.concat([after_dummy_data[[Y_COLUMN]], xx], 1)
+        xx = xx.iloc[np.where(sector_column.values == 1)[0]]
+        xx = xx.dropna()
+        xx.to_hdf(cur_dir + file_name, 'table')
+        print('Create {}'.format(file_name))
+
+    # sector별 파일 읽기
+    run_data_dict = dict()
+    run_data_dict['total'] = pd.read_hdf('data_{0:}.h5'.format('sector_total'), 'table')
+    for file_name, column in zip(file_names, sectors):
+        if column in ['communication', 'utility']:
+            continue
+        run_data_dict[column] = pd.read_hdf(file_name, 'table')
+        # validation set은 lasso에서 제외
+        run_data_dict[column] = run_data_dict[column].loc[idx[[2011, 2012, 2013, 2014, 2015], :], :]
 
     return run_data_dict
 
@@ -108,32 +144,46 @@ def get_lasso_result(alpha, max_iter):
 
     lasso_result = pd.DataFrame(columns=['sector', 'factor', 'LASSO'])
     for sector, run_data in run_data_dict.items():
+
+        if sector in ['communication', 'utility']:
+            continue
+
         print('Getting lasso regression {}...'.format(sector))
-        y = run_data['1년이내 상폐여부']
+        y = run_data[Y_COLUMN]
         x = run_data.iloc[:, 1:]
         factors = ['mse', 'predicted_r^2', 'intercept']
         factors.extend(list(x.columns))
-        sector_result = pd.DataFrame([list(index) for index in zip([sector] * len(factors), factors)],
-                                     columns=['sector', 'factor'])
-        sector_result['LASSO'] = lasso_regression(y, x, alpha, max_iter)
-        lasso_result = pd.concat([lasso_result, sector_result], ignore_index=True)
+        # sector_result = pd.DataFrame([list(index) for index in zip([sector] * len(factors), factors)],
+        #                              columns=['sector', 'factor'])
+
+        # sector_result['LASSO'] = lasso_regression(y, x, alpha, max_iter)
+        intercept = np.array([0, 0])  # 임의의 intercept
+        while intercept.size <= 10:
+            alpha = alpha / 2
+            sector_result = pd.DataFrame([list(index) for index in zip([sector] * len(factors), factors)],
+                                         columns=['sector', 'factor'])
+            sector_result['LASSO'] = lasso_regression(y, x, alpha, max_iter)
+            intercept = sector_result[
+                sector_result['factor'].isin(['mse', 'predicted_r^2', 'intercept']) | sector_result[
+                    'LASSO'].abs() >= 0.01]
+
+        lasso_result = pd.concat([lasso_result, intercept], ignore_index=True)
 
     # 'mse', 'predicted_r^2', 'intercept'는 무조건 출력하고
     # 다른 factor는 절대값이 0.0001 보다 큰 것만 출력한다.
     lasso_result = lasso_result[
-        lasso_result['factor'].isin(['mse', 'predicted_r^2', 'intercept']) | (lasso_result['LASSO'].abs() >= 0.0001)]
+        lasso_result['factor'].isin(['mse', 'predicted_r^2', 'intercept']) | (lasso_result['LASSO'].abs() >= 0.01)]
     lasso_result = lasso_result.set_index(['sector', 'factor'])
     return lasso_result
 
 
 def to_html(lasso_result, alpha, max_iter):
-    print('Start writing HTML...')
     f = open('lasso_result_{}_{}.html'.format(alpha, max_iter), 'w')
 
     html_header = '<!DOCTYPE html><meta charset="utf-8"><html><body><h3>alpha={}, max_iter={}</h3>'.format(alpha,
                                                                                                            max_iter)
     html_footer = '</body></html>'
-    html_table = lasso_result.to_html(float_format=lambda x: '%.4f' % x)
+    html_table = lasso_result.to_html(float_format=lambda x: '%.2f' % x)
 
     f.write(html_header)
     f.write(html_table)
@@ -143,7 +193,6 @@ def to_html(lasso_result, alpha, max_iter):
 
 
 def to_excel(lasso_result, alpha, max_iter):
-    print('Start writing Excel...')
     writer = pd.ExcelWriter('lasso_result.xlsx')
     lasso_result.to_excel(writer, '{}_{}'.format(alpha, max_iter))
     print('Writing Excel is done!!')
@@ -151,7 +200,7 @@ def to_excel(lasso_result, alpha, max_iter):
 
 if __name__ == '__main__':
     # Set parameters
-    alpha = 0.0001
+    alpha = 0.0004
     max_iter = 1e5
 
     # Get a lasso result dataframe.
